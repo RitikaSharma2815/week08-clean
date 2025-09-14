@@ -1,5 +1,5 @@
 # .github/workflows/backend_ci.yml
-name: Backend CI — test on dev/PR, build+push on main
+name: Backend CI — test on dev/PR, build+push on main (if secrets)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Optional; only used on main for pushing images
   ACR_NAME: ${{ secrets.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
@@ -31,7 +30,6 @@ env:
 jobs:
   test_and_lint_backends:
     runs-on: ubuntu-latest
-
     services:
       product_db:
         image: postgres:15
@@ -45,7 +43,6 @@ jobs:
           --health-timeout 5s
           --health-retries 5
         ports: [ "5432:5432" ]
-
       order_db:
         image: postgres:15
         env:
@@ -58,24 +55,16 @@ jobs:
           --health-timeout 5s
           --health-retries 5
         ports: [ "5433:5432" ]
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Cache pip
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-py310-${{ hashFiles('backend/**/requirements.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-py310-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -84,7 +73,6 @@ jobs:
             pip install -r "$req"
           done
           pip install pytest httpx
-
       - name: Run product_service tests
         working-directory: backend/product_service
         env:
@@ -94,7 +82,6 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
         run: pytest tests --maxfail=1 --disable-warnings -q
-
       - name: Run order_service tests
         working-directory: backend/order_service
         env:
@@ -106,37 +93,34 @@ jobs:
         run: pytest tests --maxfail=1 --disable-warnings -q
 
   build_and_push_images:
-    # Only on main branch (prod), after tests succeed
-    if: ${{ needs.test_and_lint_backends.result == 'success' && github.ref == 'refs/heads/main' }}
+    # Only on main AND only if all secrets exist
+    if: ${{ needs.test_and_lint_backends.result == 'success'
+            && github.ref == 'refs/heads/main'
+            && secrets.AZURE_CREDENTIALS != ''
+            && secrets.ACR_NAME != ''
+            && secrets.ACR_LOGIN_SERVER != '' }}
     runs-on: ubuntu-latest
     needs: test_and_lint_backends
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Login to Azure Container Registry
+      - name: Login to ACR
         run: az acr login --name "${{ env.ACR_NAME }}"
-
-      - name: Build and Push Product Service Image
+      - name: Build & Push Product Service
         run: |
           docker build -t "${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.IMAGE_TAG }}" ./backend/product_service/
-          docker tag "${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.IMAGE_TAG }}" "${{ env.ACR_LOGIN_SERVER }}/product_service:latest"
+          docker tag  "${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.IMAGE_TAG }}" "${{ env.ACR_LOGIN_SERVER }}/product_service:latest"
           docker push "${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.IMAGE_TAG }}"
           docker push "${{ env.ACR_LOGIN_SERVER }}/product_service:latest"
-
-      - name: Build and Push Order Service Image
+      - name: Build & Push Order Service
         run: |
           docker build -t "${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.IMAGE_TAG }}" ./backend/order_service/
-          docker tag "${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.IMAGE_TAG }}" "${{ env.ACR_LOGIN_SERVER }}/order_service:latest"
+          docker tag  "${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.IMAGE_TAG }}" "${{ env.ACR_LOGIN_SERVER }}/order_service:latest"
           docker push "${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.IMAGE_TAG }}"
           docker push "${{ env.ACR_LOGIN_SERVER }}/order_service:latest"
-
       - name: Azure Logout
         if: always()
         run: az logout

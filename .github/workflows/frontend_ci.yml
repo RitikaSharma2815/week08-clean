@@ -1,52 +1,84 @@
-name: Frontend CI - Build & Push Image
+# .github/workflows/frontend_ci.yml
+name: Frontend CI — build on dev/PR, push on main (if secrets)
 
 on:
   workflow_dispatch:
   push:
+    branches: [ dev, main ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend_ci.yml'
+  pull_request:
     branches: [ main ]
     paths:
       - 'frontend/**'
-      - '.github/workflows/frontend-ci.yml'
+      - '.github/workflows/frontend_ci.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
 jobs:
+  # Always: prove the image can build (no Azure, no push)
+  build_frontend_locally:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build (no push)
+        run: docker build -t local/frontend:${{ env.IMAGE_TAG }} ./frontend
+
+  # Compute whether we *should* push (branch == main AND all secrets exist)
+  decide_push:
+    runs-on: ubuntu-latest
+    needs: build_frontend_locally
+    outputs:
+      PUSH_OK: ${{ steps.chk.outputs.push_ok }}
+    steps:
+      - id: chk
+        env:
+          BRANCH_REF: ${{ github.ref }}
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          ok="false"
+          if [ "$BRANCH_REF" = "refs/heads/main" ] && \
+             [ -n "${ACR_NAME:-}" ] && [ -n "${ACR_LOGIN_SERVER:-}" ] && [ -n "${AZURE_CREDENTIALS:-}" ]; then
+            ok="true"
+          fi
+          echo "push_ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "Decision: push_ok=$ok"
+
+  # Only runs when decide_push says true
   build_and_push_image:
     runs-on: ubuntu-latest
-
-    env:
-      # from repo secrets
-      ACR_NAME: ${{ secrets.ACR_NAME }}                 # e.g. acrweek0820618
-      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }} # e.g. acrweek0820618.azurecr.io
-
+    needs: [build_frontend_locally, decide_push]
+    if: ${{ needs.decide_push.outputs.PUSH_OK == 'true' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ✅ Robust ACR login: if ACR_NAME is blank, derive it from ACR_LOGIN_SERVER
-      - name: Derive ACR name and login
+      - name: Login to ACR
+        run: az acr login --name "${{ secrets.ACR_NAME }}"
+
+      - name: Docker build & push
         run: |
-          ACR_LOGIN_SERVER="${{ env.ACR_LOGIN_SERVER }}"
-          if [ -z "$ACR_LOGIN_SERVER" ]; then
-            echo "Secret ACR_LOGIN_SERVER is not set."; exit 1
-          fi
-
-          ACR_NAME="${{ env.ACR_NAME }}"
-          if [ -z "$ACR_NAME" ]; then
-            ACR_NAME="$(echo "$ACR_LOGIN_SERVER" | cut -d. -f1)"
-          fi
-
-          echo "Using ACR_NAME: $ACR_NAME"
-          az acr login --name "$ACR_NAME"
-
-      # Adjust path if your Dockerfile is not in ./frontend
-      - name: Docker Build & Push
-        run: |
-          docker build -t "${{ env.ACR_LOGIN_SERVER }}/frontend:latest" ./frontend
-          docker push "${{ env.ACR_LOGIN_SERVER }}/frontend:latest"
+          docker build -t "${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}" ./frontend
+          docker tag  "${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}" "${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest"
+          docker push "${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}"
+          docker push "${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest"
 
       - name: Azure Logout
         if: always()

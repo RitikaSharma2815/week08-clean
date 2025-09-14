@@ -1,113 +1,166 @@
-name: CD - Deploy Backend Services to AKS
+# .github/workflows/backend-cd.yml
+name: Backend CD — manual deploy to AKS (protected)
 
 on:
   workflow_dispatch:
     inputs:
-      aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: 'aks-week08'
       aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
+        description: 'AKS Resource Group'
         required: true
-        default: 'rg-week08'
-      aks_acr_name:
-        description: 'Name of ACR'
+        default: 'rg-week09'
+      aks_cluster_name:
+        description: 'AKS Cluster Name'
         required: true
-        default: 'acrweek0820618'
+        default: 'aks-week09'
+      namespace:
+        description: 'Kubernetes namespace to deploy into'
+        required: true
+        default: 'shop'
+      product_service_name:
+        description: 'K8s Service name for Product API (LoadBalancer)'
+        required: true
+        default: 'product-service-w08e1'
+      order_service_name:
+        description: 'K8s Service name for Order API (LoadBalancer)'
+        required: true
+        default: 'order-service-w08e1'
+
+# Least privilege + OIDC for azure/login
+permissions:
+  contents: read
+  id-token: write
+
+# Don’t allow overlapping deploys
+concurrency:
+  group: backend-cd-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy_backend:
     runs-on: ubuntu-latest
-    environment: Production
+
+    # Use a protected environment; create it in GitHub → Settings → Environments
+    environment:
+      name: production
 
     outputs:
-      PRODUCT_API_IP: ${{ steps.get_product_ip.outputs.external_ip }}
-      ORDER_API_IP: ${{ steps.get_order_ip.outputs.external_ip }}
+      PRODUCT_API_IP: ${{ steps.capture_prod_ip.outputs.external_ip }}
+      ORDER_API_IP:   ${{ steps.capture_order_ip.outputs.external_ip }}
+
+    env:
+      NS: ${{ inputs.namespace }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Log in to Azure
-        uses: azure/login@v1
+      - name: Validate required secret
+        run: |
+          if [ -z "${{ secrets.AZURE_CREDENTIALS }}" ]; then
+            echo "::error::Missing required repository secret AZURE_CREDENTIALS"
+            exit 1
+          fi
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          enable-AzPSSession: true
 
-      - name: Set Kubernetes context (get AKS credentials)
+      - name: Get AKS credentials
         run: |
+          set -euo pipefail
           az aks get-credentials \
-            --resource-group ${{ github.event.inputs.aks_resource_group }} \
-            --name ${{ github.event.inputs.aks_cluster_name }} \
+            --resource-group "${{ inputs.aks_resource_group }}" \
+            --name "${{ inputs.aks_cluster_name }}" \
             --overwrite-existing
+          kubectl version --client=true
+          kubectl cluster-info
 
-      - name: Ensure namespace exists and set as current
+      - name: Ensure namespace exists & set context
         run: |
-          kubectl create namespace shop --dry-run=client -o yaml | kubectl apply -f -
-          kubectl config set-context --current --namespace=shop
+          set -euo pipefail
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl config set-context --current --namespace="$NS"
+          echo "Using namespace: $NS"
 
-      - name: Deploy Backend Infrastructure (Namespace, ConfigMaps, Secrets, Databases)
+      - name: Apply backend config & databases
         run: |
-          kubectl apply -n shop -f k8s/configmaps.yaml
-          kubectl apply -n shop -f k8s/secrets.yaml
-          kubectl apply -n shop -f k8s/product-db.yaml
-          kubectl apply -n shop -f k8s/order-db.yaml
+          set -euo pipefail
+          kubectl apply -n "$NS" -f k8s/configmaps.yaml
+          kubectl apply -n "$NS" -f k8s/secrets.yaml
+          kubectl apply -n "$NS" -f k8s/product-db.yaml
+          kubectl apply -n "$NS" -f k8s/order-db.yaml
 
-      - name: Deploy Backend Microservices (Product, Order)
+      - name: Deploy Product & Order services
         run: |
-          kubectl apply -n shop -f k8s/product-service.yaml
-          kubectl apply -n shop -f k8s/order-service.yaml
-          kubectl get all -n shop
+          set -euo pipefail
+          kubectl apply -n "$NS" -f k8s/product-service.yaml
+          kubectl apply -n "$NS" -f k8s/order-service.yaml
+          kubectl get all -n "$NS"
 
-      # ✅ Hardcode the correct LB service names you actually have
-      - name: Set service names explicitly
+      - name: Wait for LoadBalancer IPs
+        id: wait_ips
+        env:
+          PROD_SVC:  ${{ inputs.product_service_name }}
+          ORDER_SVC: ${{ inputs.order_service_name }}
         run: |
-          echo "PROD_SVC=product-service-w08e1"  >> $GITHUB_ENV
-          echo "ORDER_SVC=order-service-w08e1"   >> $GITHUB_ENV
-
-      # Short, robust fetch: accept ip or hostname; loop briefly just in case
-      - name: Fetch Backend LoadBalancer endpoints
-        run: |
+          set -euo pipefail
           get_lb () {
-            local svc="$1"
-            local v
-            v=$(kubectl get svc "$svc" -n shop -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            if [ -z "$v" ]; then
-              v=$(kubectl get svc "$svc" -n shop -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            fi
-            echo "$v"
+            local svc="$1" ; local ns="$2"
+            # Try IP then hostname
+            kubectl get svc "$svc" -n "$ns" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true
+          }
+          get_lb_host () {
+            local svc="$1" ; local ns="$2"
+            kubectl get svc "$svc" -n "$ns" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
           }
 
           PRODUCT_IP=""
           ORDER_IP=""
 
-          for i in $(seq 1 30); do  # ~2.5 minutes max; your IPs already exist
-            PRODUCT_IP=$(get_lb "$PROD_SVC")
-            ORDER_IP=$(get_lb "$ORDER_SVC")
-            echo "Attempt $i: $PROD_SVC => ${PRODUCT_IP:-<pending>}, $ORDER_SVC => ${ORDER_IP:-<pending>}"
-            if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then break; fi
+          for i in $(seq 1 60); do  # up to ~5 minutes
+            PRODUCT_IP="$(get_lb "$PROD_SVC" "$NS")"
+            ORDER_IP="$(get_lb "$ORDER_SVC" "$NS")"
+
+            if [ -z "$PRODUCT_IP" ]; then PRODUCT_IP="$(get_lb_host "$PROD_SVC" "$NS")"; fi
+            if [ -z "$ORDER_IP" ]; then ORDER_IP="$(get_lb_host "$ORDER_SVC" "$NS")"; fi
+
+            echo "Attempt $i:"
+            echo "  $PROD_SVC  => ${PRODUCT_IP:-<pending>}"
+            echo "  $ORDER_SVC => ${ORDER_IP:-<pending>}"
+
+            if [ -n "$PRODUCT_IP" ] && [ -n "$ORDER_IP" ]; then break; fi
             sleep 5
           done
 
-          if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
-            echo "Services didn't report LB endpoints fast enough:"
-            kubectl get svc -n shop -o wide || true
+          if [ -z "$PRODUCT_IP" ] || [ -z "$ORDER_IP" ]; then
+            echo "::error::Timed out waiting for LoadBalancer IPs."
+            kubectl get svc -n "$NS" -o wide || true
             exit 1
           fi
 
-          echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
-          echo "ORDER_IP=$ORDER_IP"   >> $GITHUB_ENV
-          echo "Product endpoint: $PRODUCT_IP"
-          echo "Order endpoint:   $ORDER_IP"
+          echo "PRODUCT_IP=$PRODUCT_IP" >> "$GITHUB_ENV"
+          echo "ORDER_IP=$ORDER_IP"     >> "$GITHUB_ENV"
 
-      - name: Capture Product Service IP for Workflow Output
-        id: get_product_ip
-        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> $GITHUB_OUTPUT
+      - name: Capture Product IP (job output)
+        id: capture_prod_ip
+        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> "$GITHUB_OUTPUT"
 
-      - name: Capture Order Service IP for Workflow Output
-        id: get_order_ip
-        run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
+      - name: Capture Order IP (job output)
+        id: capture_order_ip
+        run: echo "external_ip=${{ env.ORDER_IP }}" >> "$GITHUB_OUTPUT"
 
-      - name: Logout from Azure
+      - name: Add Deployment Summary
+        if: ${{ success() }}
+        run: |
+          {
+            echo "### Backend deployed"
+            echo ""
+            echo "- **Namespace:** \`${{ env.NS }}\`"
+            echo "- **Product API:** \`${{ env.PRODUCT_IP }}\`"
+            echo "- **Order API:**   \`${{ env.ORDER_IP }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure Logout
+        if: always()
         run: az logout
